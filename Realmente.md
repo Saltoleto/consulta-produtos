@@ -1,175 +1,457 @@
-Perfeito! Aqui está um **resumo detalhado** de tudo que discutimos, estruturado de forma que você pode apresentar ao seu techlead. Vou organizar em tópicos claros: **cenário, problemas, soluções, código e configuração de pool**.
+package com.exemplo.processamento;
 
----
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.actuate.health.Health;
+import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.concurrent.ListenableFutureCallback;
 
-# Resumo Técnico – Processamento de Contas com Spring Boot e Aurora
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
-## 1️⃣ Cenário
-
-* Aplicação Spring Boot processa mensagens do **SQS**, cada mensagem contendo até **10.000 contas**.
-* Cada lista de contas é dividida em **lotes de 100 contas**.
-* Para cada lote, deve-se realizar **5 operações sequenciais no banco**:
-
-  1. Persistir Instituições
-  2. Persistir Consentimentos
-  3. Persistir Contas
-  4. Persistir Detalhes das Contas
-  5. Persistir Associações Conta ⇆ Usuário
-* Após persistir cada lote, enviar **eventos para Kafka**, conta a conta, de forma **assíncrona**.
-* Aplicação roda em **múltiplos pods no EKS**.
-* Banco: **Aurora MySQL** com **5.000 conexões disponíveis**.
-* Ferramentas utilizadas:
-
-  * `NamedParameterJdbcTemplate` + `batchUpdate`
-  * `HikariCP` para pool de conexões
-  * Virtual Threads (Java 21) para paralelismo leve
-  * KafkaTemplate para envio de eventos
-
----
-
-## 2️⃣ Problemas identificados
-
-1. **Timeouts ao processar 10 arquivos de 10k contas cada**:
-
-   * Mesmo com Aurora suportando 5.000 conexões, o pool HikariCP limitado por pod (ex: 100) causa bloqueio de threads virtuais aguardando conexão.
-2. **Concorrência descontrolada**:
-
-   * Muitas virtual threads criadas simultaneamente por lote, mas **cada thread precisa de uma conexão**.
-   * Threads excedendo o pool ficam bloqueadas → `connectionTimeout` disparado.
-3. **Transações por método individual**:
-
-   * Colocar `@Transactional` em cada método de persistência quebra atomicidade do lote e pode causar dados inconsistentes e envio de eventos Kafka prematuro.
-
----
-
-## 3️⃣ Soluções propostas
-
-### 3.1 Controle de concorrência de lotes
-
-* Utilizar um **`Semaphore`** para limitar a quantidade de lotes processados simultaneamente por pod, **compatível com o tamanho do pool do Hikari** (ex: 30).
-* Isso garante que **nenhuma thread virtual fique bloqueada por falta de conexão** por muito tempo.
-
-### 3.2 Transação por lote
-
-* Colocar `@Transactional` em **todo o método `processarLote`**, garantindo:
-
-  * Atomicidade completa do lote.
-  * Nenhum evento Kafka é enviado se algum insert falhar.
-* Não colocar transação em cada método individual, pois quebra consistência.
-
-### 3.3 Envio assíncrono de eventos Kafka
-
-* Criar **executor separado (`FixedThreadPool`)** para envio assíncrono.
-* Cada conta do lote envia evento para Kafka de forma não bloqueante.
-* Limitar número de threads Kafka (ex: 10) para evitar sobrecarga.
-
-### 3.4 Uso de Virtual Threads
-
-* Executor de **Virtual Threads (`newVirtualThreadPerTaskExecutor`)** para processar lotes:
-
-  * Permite milhares de tarefas sem consumo significativo de memória.
-  * Mas não substitui a necessidade de **conexões do pool Hikari**.
-
-### 3.5 Configuração de pool HikariCP
-
-* Deve ser **compatível com o número de lotes simultâneos** (limite do Semaphore).
-* Exemplo recomendado: 30 conexões por pod para o cenário atual.
-
----
-
-## 4️⃣ Código final recomendado
-
-```java
+/**
+ * Processador de contas melhorado com:
+ * - Configurações externalizáveis
+ * - Métricas e observabilidade
+ * - Circuit breaker pattern
+ * - Retry policies
+ * - Shutdown graceful
+ * - Logs estruturados
+ * - Validação de entrada
+ * - Tratamento robusto de exceções
+ */
 @Service
-public class ContaProcessor {
+public class ContaProcessorMelhorado implements HealthIndicator {
+
+    private static final Logger logger = LoggerFactory.getLogger(ContaProcessorMelhorado.class);
 
     private final NamedParameterJdbcTemplate jdbcTemplate;
     private final KafkaTemplate<String, String> kafkaTemplate;
+    private final MeterRegistry meterRegistry;
+    private final ContaValidator contaValidator;
+    private final CircuitBreakerService circuitBreakerService;
 
-    private final ExecutorService persistExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    private final ExecutorService kafkaExecutor = Executors.newFixedThreadPool(10);
-    private final Semaphore semaphore = new Semaphore(30); // limita lotes simultâneos
+    // Configurações externalizáveis
+    @Value("${app.processamento.lote-size:100}")
+    private int loteSize;
 
-    public ContaProcessor(NamedParameterJdbcTemplate jdbcTemplate,
-                          KafkaTemplate<String, String> kafkaTemplate) {
+    @Value("${app.processamento.max-lotes-simultaneos:30}")
+    private int maxLotesSimultaneos;
+
+    @Value("${app.processamento.max-kafka-simultaneos:50}")
+    private int maxKafkaSimultaneos;
+
+    @Value("${app.processamento.timeout-shutdown:30}")
+    private int timeoutShutdownSegundos;
+
+    @Value("${app.kafka.topic.contas-processadas:contas.processadas}")
+    private String kafkaTopicContasProcessadas;
+
+    @Value("${app.processamento.enable-circuit-breaker:true}")
+    private boolean enableCircuitBreaker;
+
+    // Executors com nomes descritivos
+    private ExecutorService persistExecutor;
+    private ExecutorService kafkaExecutor;
+
+    // Semáforos para controle de concorrência
+    private Semaphore lotesSemaphore;
+    private Semaphore kafkaSemaphore;
+
+    // Métricas
+    private Counter lotesProcessadosCounter;
+    private Counter contasProcessadasCounter;
+    private Counter errosProcessamentoCounter;
+    private Counter eventosKafkaEnviadosCounter;
+    private Counter eventosKafkaFalhasCounter;
+    private Timer tempoProcessamentoLoteTimer;
+    private Timer tempoEnvioKafkaTimer;
+    private AtomicInteger lotesSemaphoreUtilizacao;
+    private AtomicInteger kafkaSemaphoreUtilizacao;
+
+    // Estado para health check
+    private volatile boolean healthy = true;
+    private volatile String lastError = null;
+    private volatile Instant lastProcessingTime = Instant.now();
+
+    public ContaProcessorMelhorado(NamedParameterJdbcTemplate jdbcTemplate,
+                                   KafkaTemplate<String, String> kafkaTemplate,
+                                   MeterRegistry meterRegistry,
+                                   ContaValidator contaValidator,
+                                   CircuitBreakerService circuitBreakerService) {
         this.jdbcTemplate = jdbcTemplate;
         this.kafkaTemplate = kafkaTemplate;
+        this.meterRegistry = meterRegistry;
+        this.contaValidator = contaValidator;
+        this.circuitBreakerService = circuitBreakerService;
     }
 
-    public void processarLotes(List<Conta> contas) {
-        List<List<Conta>> lotes = ListUtils.partition(contas, 100);
+    @PostConstruct
+    public void inicializar() {
+        logger.info("Inicializando ContaProcessor com configurações: loteSize={}, maxLotesSimultaneos={}, maxKafkaSimultaneos={}",
+                loteSize, maxLotesSimultaneos, maxKafkaSimultaneos);
 
-        for (List<Conta> lote : lotes) {
-            persistExecutor.submit(() -> {
-                try {
-                    semaphore.acquire();
-                    processarLote(lote);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    semaphore.release();
-                }
-            });
+        // Inicializar executors com thread factories nomeadas
+        this.persistExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        this.kafkaExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+        // Inicializar semáforos
+        this.lotesSemaphore = new Semaphore(maxLotesSimultaneos);
+        this.kafkaSemaphore = new Semaphore(maxKafkaSimultaneos);
+
+        // Inicializar métricas
+        inicializarMetricas();
+
+        logger.info("ContaProcessor inicializado com sucesso");
+    }
+
+    private void inicializarMetricas() {
+        this.lotesProcessadosCounter = Counter.builder("conta_processor_lotes_processados_total")
+                .description("Total de lotes processados")
+                .register(meterRegistry);
+
+        this.contasProcessadasCounter = Counter.builder("conta_processor_contas_processadas_total")
+                .description("Total de contas processadas")
+                .register(meterRegistry);
+
+        this.errosProcessamentoCounter = Counter.builder("conta_processor_erros_total")
+                .description("Total de erros no processamento")
+                .tag("tipo", "processamento")
+                .register(meterRegistry);
+
+        this.eventosKafkaEnviadosCounter = Counter.builder("conta_processor_kafka_eventos_enviados_total")
+                .description("Total de eventos enviados para Kafka")
+                .register(meterRegistry);
+
+        this.eventosKafkaFalhasCounter = Counter.builder("conta_processor_kafka_falhas_total")
+                .description("Total de falhas no envio para Kafka")
+                .register(meterRegistry);
+
+        this.tempoProcessamentoLoteTimer = Timer.builder("conta_processor_lote_processamento_duration")
+                .description("Tempo de processamento de lote")
+                .register(meterRegistry);
+
+        this.tempoEnvioKafkaTimer = Timer.builder("conta_processor_kafka_envio_duration")
+                .description("Tempo de envio para Kafka")
+                .register(meterRegistry);
+
+        // Gauges para monitorar utilização dos semáforos
+        this.lotesSemaphoreUtilizacao = new AtomicInteger(0);
+        this.kafkaSemaphoreUtilizacao = new AtomicInteger(0);
+
+        Gauge.builder("conta_processor_lotes_semaphore_utilizacao")
+                .description("Utilização atual do semáforo de lotes")
+                .register(meterRegistry, this, processor -> processor.lotesSemaphoreUtilizacao.get());
+
+        Gauge.builder("conta_processor_kafka_semaphore_utilizacao")
+                .description("Utilização atual do semáforo de Kafka")
+                .register(meterRegistry, this, processor -> processor.kafkaSemaphoreUtilizacao.get());
+
+        Gauge.builder("conta_processor_lotes_semaphore_disponivel")
+                .description("Permits disponíveis no semáforo de lotes")
+                .register(meterRegistry, this, processor -> processor.lotesSemaphore.availablePermits());
+
+        Gauge.builder("conta_processor_kafka_semaphore_disponivel")
+                .description("Permits disponíveis no semáforo de Kafka")
+                .register(meterRegistry, this, processor -> processor.kafkaSemaphore.availablePermits());
+    }
+
+    /**
+     * Método principal para processar lista de contas
+     */
+    public void processarLotes(List<Conta> contas) {
+        String correlationId = UUID.randomUUID().toString();
+        MDC.put("correlationId", correlationId);
+        
+        try {
+            logger.info("Iniciando processamento de {} contas em lotes de {}", contas.size(), loteSize);
+            
+            // Validação de entrada
+            if (contas == null || contas.isEmpty()) {
+                logger.warn("Lista de contas vazia ou nula recebida");
+                return;
+            }
+
+            // Validar contas
+            List<Conta> contasValidas = contaValidator.validarEFiltrarContas(contas);
+            if (contasValidas.size() != contas.size()) {
+                logger.warn("Filtradas {} contas inválidas de um total de {}", 
+                    contas.size() - contasValidas.size(), contas.size());
+            }
+
+            // Dividir em lotes
+            List<List<Conta>> lotes = ListUtils.partition(contasValidas, loteSize);
+            logger.info("Dividindo {} contas válidas em {} lotes", contasValidas.size(), lotes.size());
+
+            // Processar lotes
+            CompletableFuture<?>[] futures = lotes.stream()
+                    .map(this::processarLoteAsync)
+                    .toArray(CompletableFuture[]::new);
+
+            // Aguardar conclusão de todos os lotes
+            CompletableFuture.allOf(futures).join();
+            
+            lastProcessingTime = Instant.now();
+            healthy = true;
+            lastError = null;
+            
+            logger.info("Processamento concluído com sucesso para {} lotes", lotes.size());
+            
+        } catch (Exception e) {
+            healthy = false;
+            lastError = e.getMessage();
+            errosProcessamentoCounter.increment();
+            logger.error("Erro no processamento de lotes", e);
+            throw new ProcessamentoException("Falha no processamento de lotes", e);
+        } finally {
+            MDC.clear();
         }
     }
 
-    @Transactional
-    public void processarLote(List<Conta> lote) {
-        salvarInstituicoes(lote);
-        salvarConsentimentos(lote);
-        salvarContas(lote);
-        salvarDetalhesContas(lote);
-        salvarAssociacoes(lote);
-
-        lote.forEach(conta ->
-            kafkaExecutor.submit(() ->
-                kafkaTemplate.send("contas.processadas", conta.getId().toString(), conta.toJson())
-            )
-        );
+    private CompletableFuture<Void> processarLoteAsync(List<Conta> lote) {
+        return CompletableFuture.runAsync(() -> {
+            String loteId = UUID.randomUUID().toString();
+            MDC.put("loteId", loteId);
+            
+            boolean acquired = false;
+            try {
+                // Tentar adquirir permit com timeout
+                acquired = lotesSemaphore.tryAcquire(30, TimeUnit.SECONDS);
+                if (!acquired) {
+                    throw new ProcessamentoException("Timeout ao aguardar semáforo de lotes");
+                }
+                
+                lotesSemaphoreUtilizacao.incrementAndGet();
+                processarLote(lote);
+                
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.error("Thread interrompida durante processamento do lote {}", loteId, e);
+                throw new ProcessamentoException("Processamento interrompido", e);
+            } catch (Exception e) {
+                errosProcessamentoCounter.increment();
+                logger.error("Erro no processamento do lote {}", loteId, e);
+                throw new ProcessamentoException("Falha no processamento do lote", e);
+            } finally {
+                if (acquired) {
+                    lotesSemaphore.release();
+                    lotesSemaphoreUtilizacao.decrementAndGet();
+                }
+                MDC.clear();
+            }
+        }, persistExecutor);
     }
 
-    private void salvarInstituicoes(List<Conta> lote) { /* batchUpdate */ }
-    private void salvarConsentimentos(List<Conta> lote) { /* batchUpdate */ }
-    private void salvarContas(List<Conta> lote) { /* batchUpdate */ }
-    private void salvarDetalhesContas(List<Conta> lote) { /* batchUpdate */ }
-    private void salvarAssociacoes(List<Conta> lote) { /* batchUpdate */ }
+    @Transactional
+    @Retryable(value = {Exception.class}, maxAttempts = 3, backoff = @Backoff(delay = 1000, multiplier = 2))
+    public void processarLote(List<Conta> lote) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        try {
+            logger.debug("Processando lote com {} contas", lote.size());
+
+            // Verificar circuit breaker se habilitado
+            if (enableCircuitBreaker && !circuitBreakerService.isAvailable("database")) {
+                throw new ProcessamentoException("Circuit breaker aberto para database");
+            }
+
+            // Persistência sequencial com circuit breaker
+            executarComCircuitBreaker(() -> salvarInstituicoes(lote), "database");
+            executarComCircuitBreaker(() -> salvarConsentimentos(lote), "database");
+            executarComCircuitBreaker(() -> salvarContas(lote), "database");
+            executarComCircuitBreaker(() -> salvarDetalhesContas(lote), "database");
+            executarComCircuitBreaker(() -> salvarAssociacoes(lote), "database");
+
+            // Envio assíncrono para Kafka
+            enviarEventosKafkaAsync(lote);
+
+            // Atualizar métricas
+            lotesProcessadosCounter.increment();
+            contasProcessadasCounter.increment(lote.size());
+            
+            logger.debug("Lote processado com sucesso: {} contas", lote.size());
+
+        } catch (Exception e) {
+            logger.error("Erro no processamento do lote", e);
+            throw e;
+        } finally {
+            sample.stop(tempoProcessamentoLoteTimer);
+        }
+    }
+
+    private void executarComCircuitBreaker(Runnable operacao, String serviceName) {
+        if (enableCircuitBreaker) {
+            circuitBreakerService.execute(operacao, serviceName);
+        } else {
+            operacao.run();
+        }
+    }
+
+    private void enviarEventosKafkaAsync(List<Conta> lote) {
+        lote.forEach(conta -> {
+            CompletableFuture.runAsync(() -> {
+                boolean acquired = false;
+                try {
+                    acquired = kafkaSemaphore.tryAcquire(10, TimeUnit.SECONDS);
+                    if (!acquired) {
+                        logger.warn("Timeout ao aguardar semáforo Kafka para conta {}", conta.getId());
+                        return;
+                    }
+                    
+                    kafkaSemaphoreUtilizacao.incrementAndGet();
+                    enviarEventoKafka(conta);
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    logger.error("Thread interrompida durante envio Kafka para conta {}", conta.getId(), e);
+                } catch (Exception e) {
+                    eventosKafkaFalhasCounter.increment();
+                    logger.error("Erro no envio Kafka para conta {}", conta.getId(), e);
+                } finally {
+                    if (acquired) {
+                        kafkaSemaphore.release();
+                        kafkaSemaphoreUtilizacao.decrementAndGet();
+                    }
+                }
+            }, kafkaExecutor);
+        });
+    }
+
+    @Retryable(value = {Exception.class}, maxAttempts = 3, backoff = @Backoff(delay = 500, multiplier = 2))
+    private void enviarEventoKafka(Conta conta) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        try {
+            // Verificar circuit breaker para Kafka
+            if (enableCircuitBreaker && !circuitBreakerService.isAvailable("kafka")) {
+                throw new ProcessamentoException("Circuit breaker aberto para Kafka");
+            }
+
+            String eventoJson = conta.toJson();
+            
+            kafkaTemplate.send(kafkaTopicContasProcessadas, conta.getId().toString(), eventoJson)
+                    .addCallback(new ListenableFutureCallback<SendResult<String, String>>() {
+                        @Override
+                        public void onSuccess(SendResult<String, String> result) {
+                            eventosKafkaEnviadosCounter.increment();
+                            logger.debug("Evento Kafka enviado com sucesso para conta {}", conta.getId());
+                        }
+
+                        @Override
+                        public void onFailure(Throwable ex) {
+                            eventosKafkaFalhasCounter.increment();
+                            logger.error("Falha no envio do evento Kafka para conta {}", conta.getId(), ex);
+                        }
+                    });
+
+        } catch (Exception e) {
+            eventosKafkaFalhasCounter.increment();
+            logger.error("Erro no envio do evento Kafka para conta {}", conta.getId(), e);
+            throw e;
+        } finally {
+            sample.stop(tempoEnvioKafkaTimer);
+        }
+    }
+
+    // Métodos de persistência com logs estruturados
+    private void salvarInstituicoes(List<Conta> lote) {
+        logger.debug("Salvando instituições para {} contas", lote.size());
+        // Implementação do batch update
+        // jdbcTemplate.batchUpdate(sql, parameterSources);
+    }
+
+    private void salvarConsentimentos(List<Conta> lote) {
+        logger.debug("Salvando consentimentos para {} contas", lote.size());
+        // Implementação do batch update
+    }
+
+    private void salvarContas(List<Conta> lote) {
+        logger.debug("Salvando contas: {}", lote.size());
+        // Implementação do batch update
+    }
+
+    private void salvarDetalhesContas(List<Conta> lote) {
+        logger.debug("Salvando detalhes das contas: {}", lote.size());
+        // Implementação do batch update
+    }
+
+    private void salvarAssociacoes(List<Conta> lote) {
+        logger.debug("Salvando associações para {} contas", lote.size());
+        // Implementação do batch update
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        logger.info("Iniciando shutdown graceful do ContaProcessor");
+        
+        try {
+            // Parar de aceitar novos trabalhos
+            persistExecutor.shutdown();
+            kafkaExecutor.shutdown();
+            
+            // Aguardar conclusão dos trabalhos em andamento
+            boolean persistTerminated = persistExecutor.awaitTermination(timeoutShutdownSegundos, TimeUnit.SECONDS);
+            boolean kafkaTerminated = kafkaExecutor.awaitTermination(timeoutShutdownSegundos, TimeUnit.SECONDS);
+            
+            if (!persistTerminated) {
+                logger.warn("Executor de persistência não terminou no tempo esperado, forçando shutdown");
+                persistExecutor.shutdownNow();
+            }
+            
+            if (!kafkaTerminated) {
+                logger.warn("Executor de Kafka não terminou no tempo esperado, forçando shutdown");
+                kafkaExecutor.shutdownNow();
+            }
+            
+            logger.info("Shutdown do ContaProcessor concluído");
+            
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.error("Shutdown interrompido", e);
+            persistExecutor.shutdownNow();
+            kafkaExecutor.shutdownNow();
+        }
+    }
+
+    @Override
+    public Health health() {
+        Health.Builder builder = healthy ? Health.up() : Health.down();
+        
+        builder.withDetail("lastProcessingTime", lastProcessingTime)
+               .withDetail("lotesSemaphoreAvailable", lotesSemaphore.availablePermits())
+               .withDetail("kafkaSemaphoreAvailable", kafkaSemaphore.availablePermits())
+               .withDetail("persistExecutorTerminated", persistExecutor.isTerminated())
+               .withDetail("kafkaExecutorTerminated", kafkaExecutor.isTerminated());
+        
+        if (lastError != null) {
+            builder.withDetail("lastError", lastError);
+        }
+        
+        return builder.build();
+    }
+
+    // Getters para testes
+    public int getLoteSize() { return loteSize; }
+    public int getMaxLotesSimultaneos() { return maxLotesSimultaneos; }
+    public int getMaxKafkaSimultaneos() { return maxKafkaSimultaneos; }
 }
-```
 
----
-
-## 5️⃣ Configuração `application.yml` recomendada
-
-```yaml
-spring:
-  datasource:
-    url: jdbc:mysql://aurora-writer-endpoint:3306/meubanco
-    username: usuario
-    password: senha
-    driver-class-name: com.mysql.cj.jdbc.Driver
-    hikari:
-      maximum-pool-size: 30       # compatível com o semáforo
-      minimum-idle: 5
-      idle-timeout: 600000        # 10 min
-      max-lifetime: 1800000       # 30 min
-      connection-timeout: 60000   # 60s
-```
-
----
-
-## 6️⃣ Benefícios dessa abordagem
-
-* **Atomicidade por lote** → nenhum dado parcial é persistido.
-* **Evita timeout no HikariCP** → semáforo limita lotes simultâneos.
-* **Assíncrono e escalável** → virtual threads + executor Kafka.
-* **Fluxo previsível e seguro para Kafka** → eventos só são enviados após commit do lote.
-* **Compatível com múltiplas réplicas no EKS**.
-
----
-
-Se você quiser, posso também gerar **um diagrama visual do fluxo completo** mostrando:
-
-* Recebimento SQS → divisão em lotes → processamento sequencial → transação → envio Kafka.
-  Isso facilita a apresentação para o techlead.
-
-Quer que eu faça isso?
