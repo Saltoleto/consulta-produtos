@@ -1,6 +1,4 @@
-Perfeito! Aqui está um **pacote completo** consolidando tudo que discutimos: **resumo técnico**, **código final** e **configuração do datasource (`application.yml`)**.
 
----
 
 # 1️⃣ Resumo Técnico – Processamento de Contas
 
