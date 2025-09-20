@@ -1,4 +1,4 @@
-Perfeito! Aqui está uma versão **otimizada para LinkedIn**, com formatação, emojis, trechos de código destacados e leitura rápida. Você pode copiar e colar diretamente:
+Perfeito! Aqui está a versão final do artigo para LinkedIn, **atualizada** com o link do projeto no GitHub e pronta para engajamento:
 
 ---
 
@@ -7,6 +7,8 @@ Perfeito! Aqui está uma versão **otimizada para LinkedIn**, com formatação, 
 💡 **O desafio:** Persistir **30.000 registros por segundo** em um banco MySQL Aurora, de forma escalável e eficiente.
 
 Recentemente, desenvolvi um projeto para **persistir contas correntes** usando técnicas modernas de Java, e os resultados foram surpreendentes.
+
+Confira o projeto completo no GitHub: [https://github.com/Saltoleto/consulta-produtos/tree/main](https://github.com/Saltoleto/consulta-produtos/tree/main)
 
 ---
 
@@ -72,6 +74,8 @@ Isso mantém a performance consistente em cenários concorrentes.
 * `BenchmarkController.java` – endpoint REST para teste de benchmark
 * Docker Compose com MySQL writer + reader
 
+Projeto completo disponível no GitHub: [https://github.com/Saltoleto/consulta-produtos/tree/main](https://github.com/Saltoleto/consulta-produtos/tree/main)
+
 ---
 
 ## ✅ Conclusão
@@ -90,6 +94,6 @@ Comece implementando batchs pequenos e vá aumentando gradualmente, sempre monit
 
 ---
 
-Se quiser, posso criar também uma **versão ainda mais visual**, com **emoji + cores + call-to-action final**, que aumenta engajamento no LinkedIn e atrai comentários.
+Se quiser, posso criar uma **versão ainda mais visual para LinkedIn**, com emojis, chamadas de atenção e formatação extra que aumenta engajamento.
 
 Quer que eu faça essa versão visual otimizada?
