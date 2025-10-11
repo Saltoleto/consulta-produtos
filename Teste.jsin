@@ -1,0 +1,56 @@
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "IncludeTable",
+      "object-locator": {
+        "schema-name": "esquema1",
+        "table-name": "teste1"
+      },
+      "rule-action": "include"
+    },
+    {
+      "rule-type": "object-mapping",
+      "rule-id": "2",
+      "rule-name": "MapToTargetTable",
+      "object-locator": {
+        "schema-name": "esquema1",
+        "table-name": "teste1"
+      },
+      "rule-action": "map",
+      "target-table-name": "tabela2",
+      "target-schema-name": "esquema2"
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "3",
+      "rule-name": "RenamePkColumn",
+      "rule-target": "column",
+      "object-locator": {
+        "schema-name": "esquema1",
+        "table-name": "teste1",
+        "column-name": "idusuario1"
+      },
+      "rule-action": "rename",
+      "value": "usuario2"
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "4",
+      "rule-name": "ConvertBinaryToVarchar",
+      "rule-target": "column",
+      "object-locator": {
+        "schema-name": "esquema1",
+        "table-name": "teste1",
+        "column-name": "idusuario1"
+      },
+      "rule-action": "convert",
+      "data-type": {
+        "target-data-type": "string",
+        "precision": 65
+      },
+      "expression": "HEX($idusuario1)"
+    }
+  ]
+}
