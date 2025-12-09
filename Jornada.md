@@ -238,6 +238,180 @@ documentacao/
  │   └─ seq-processamento.puml
 ```
 
+Perfeito. Vou gerar **a visão corporativa completa** considerando:
+
+* **APP-A** → onboarding, consulta contas, agrupamento
+* **APP-B** → processamento de permissionamento
+* **APP-C** → consulta contas corrente
+* E vou estruturar o modelo para permitir expansão (“etc.”) sem precisar de detalhes adicionais.
+
+A seguir está **o pacote completo** com a visão macro, jornadas x siglas e fluxos integrados.
+
+---
+
+# 🏛️ **1. Visão Geral Corporativa (C4 — System Landscape)**
+
+### **Descrição**
+
+Mostra como as siglas se relacionam, quais integrações existem e como as jornadas fluem entre as aplicações.
+
+---
+
+## **📌 Diagrama (PlantUML — pronto para colar no Confluence/Git)**
+
+```plantuml
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+Person(operador, "Operador", "Usuário do bankline")
+
+System(APP_A, "APP-A", "Realiza onboarding, consulta contas e agrupamento")
+System(APP_B, "APP-B", "Processa permissionamento e gera arquivos")
+System(APP_C, "APP-C", "Consulta contas corrente")
+System(APP_OF, "APP-D / Open Finance", "Consulta contas Open Finance")
+System(APP_PF, "APP-E / Produtos Financeiros", "Consulta produtos e permissões")
+System(S3, "S3", "Armazenamento de arquivos")
+System(SQS, "SQS", "Fila de eventos")
+System(Dynamo, "DynamoDB", "Armazena acessos e agrupamentos")
+System(Redis, "Redis", "Cache de contas e produtos")
+
+Rel(operador, APP_A, "Inicia jornadas via HTTP")
+Rel(APP_A, APP_C, "Consulta contas correntes", "REST")
+Rel(APP_A, APP_OF, "Consulta contas Open Finance", "REST")
+Rel(APP_A, Dynamo, "Salva acessos / agrupamentos")
+Rel(APP_A, Redis, "Cache de contas (TTL)")
+
+Rel(APP_A, SQS, "Publica evento de permissionamento", "SQS")
+Rel(SQS, APP_B, "Dispara processamento", "SQS")
+Rel(APP_B, S3, "Gera arquivo de produtos", "PUT")
+Rel(APP_A, S3, "Lê arquivo de produtos processado", "GET")
+
+Rel(APP_A, APP_PF, "Consulta/valida produtos financeiros", "REST")
+
+@enduml
+```
+
+---
+
+# 🗺️ **2. Mapa de Jornadas x Siglas**
+
+Mostra **quem participa de cada jornada**, facilitando análise de dependências e impacto.
+
+| Jornada                        | APP-A | APP-B | APP-C | Open Finance | Produtos | SQS | S3 | Dynamo | Redis |
+| ------------------------------ | ----- | ----- | ----- | ------------ | -------- | --- | -- | ------ | ----- |
+| **Onboarding Operador**        | ✔️    | ❌     | ✔️    | ✔️           | ❌        | ❌   | ❌  | ✔️     | ✔️    |
+| **Consulta Contas**            | ✔️    | ❌     | ✔️    | ✔️           | ❌        | ❌   | ❌  | ✔️     | ✔️    |
+| **Agrupamento**                | ✔️    | ❌     | ❌     | ❌            | ❌        | ❌   | ❌  | ✔️     | ❌     |
+| **Iniciar Permissionamento**   | ✔️    | ✔️    | ❌     | ❌            | ✔️       | ✔️  | ✔️ | ✔️     | ❌     |
+| **Processar Permissionamento** | ❌     | ✔️    | ❌     | ❌            | ✔️       | ✔️  | ✔️ | ✔️     | ❌     |
+| **Consulta Produtos**          | ✔️    | ❌     | ❌     | ❌            | ✔️       | ❌   | ❌  | ❌      | ✔️    |
+
+Esse mapa permite ver:
+
+* Dependências fortes
+* Possíveis gargalos
+* Onde uma falha afeta múltiplas jornadas
+* O que é crítico em cada fluxo
+
+---
+
+# 🔄 **3. Fluxo Integrado Entre Siglas (Diagrama de Sequência Corporativo)**
+
+Esse diagrama consolida **todas as jornadas principais** entre múltiplas siglas.
+
+```plantuml
+@startuml
+actor Operador
+
+Operador -> APP-A: POST /onboarding
+APP-A -> APP-C: GET /contas-corrente
+APP-A -> APP-D: GET /contas-open-finance
+APP-A -> Dynamo: grava acesso
+APP-A -> Redis: cache contas
+APP-A --> Operador: retorna contas
+
+== Agrupamento ==
+Operador -> APP-A: POST /agrupamento
+APP-A -> Dynamo: grava agrupamento
+APP-A --> Operador: agrupamento criado
+
+== Iniciar Permissionamento ==
+Operador -> APP-A: POST /produtos/atualizar
+APP-A -> APP-PF: consulta produtos permitidos
+APP-A -> SQS: publica evento de permissionamento
+
+== Processamento (APP-B) ==
+SQS -> APP-B: evento recebido
+APP-B -> S3: cria arquivo com permissões processadas
+APP-B -> Dynamo: atualiza permissões
+
+== APP-A lê resultado ==
+APP-A -> S3: GET arquivo de produtos
+APP-A -> Dynamo: salva produtos finalizados
+APP-A --> Operador: retorna produtos consolidados
+
+@enduml
+```
+
+Esse diagrama mostra a **cadeia completa inter-siglas** em todas as jornadas.
+
+---
+
+# 🔍 **4. Visão Consolidada (Texto Executivo)**
+
+**APP-A** é o orquestrador principal.
+Ele:
+
+* Recebe o onboarding
+* Consulta contas
+* Cria agrupamentos
+* Publica eventos de permissionamento
+* Consolida produtos depois do processamento
+
+**APP-B** é o “músculo” de processamento pesado.
+Ele:
+
+* Recebe eventos via SQS
+* Gera arquivos
+* Atualiza permissões
+
+**APP-C** e **Open Finance** são provedores de contas.
+**Produtos Financeiros** é provedor de permissões e produtos.
+**DynamoDB**, **Redis**, **SQS**, **S3** sustentam o fluxo.
+
+---
+
+# 🧱 **5. Essa visão permite:**
+
+### ✔️ Entender claramente como todas as siglas se conectam
+
+### ✔️ Mapear impacto de mudanças
+
+### ✔️ Ver dependências entre jornadas
+
+### ✔️ Facilitar discussões com arquitetura / diretoria
+
+### ✔️ Criar materiais corporativos e executivos
+
+### ✔️ Identificar pontos de acoplamento entre times
+
+### ✔️ Identificar onde é necessário observabilidade e resiliência
+
+---
+
+# 📌 **Pergunta final para gerar a versão definitiva**
+
+Posso agora gerar:
+
+1. **Um PDF consolidado**
+2. **Um pacote Markdown pronto para Git**
+3. **Versão pronta para Confluence**
+4. **Todos os diagramas como arquivos separados**
+5. **Uma visão executiva estilo “Arquitetura Corporativa”**
+
+**Qual formato você quer que eu gere agora?**
+
+
 ---
 
 # ⚡ **6. Se quiser, posso gerar para você:**
